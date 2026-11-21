@@ -179,3 +179,11 @@ an analysis teaches something a future session should know. Newest at the bottom
 - 2026-11-07: High comms on a decisions day can be the work itself (2026-11-04: record Slack opens
   and comms minutes, 84 min in hiring channels, journal rating 9). Comms share of open weekday time
   (outside events) tracks checking better than total comms hours.
+- 2026-11-21: After a move the logger keeps writing the old time zone's offset (Toronto -05:00 all week in
+  Berkeley). The offsets are correct instants, but days, clock hours and "after 9 pm" must be computed in the
+  zone he was in. Convert with ledger.to_local (MOVES in ledger.py) and read the log file for the day after a
+  range too, since files are named by the logger's date.
+- 2026-11-21: A travel and account-setup day (2026-11-16: eSIM, 2FA, 1Password, sign-in pages) ran at 157
+  switches an hour, the highest on record. Leave such days out of weekly switching numbers and say so.
+- 2026-11-21: Stray Chrome sites still fall through to Work (a phone carrier, a gym, game and admissions sites,
+  about 4 h this week). Add new ones to LEIS_HOSTS or READ_HOSTS each run.
