@@ -81,9 +81,9 @@ How to analyze the Activity Logger's logs: the rules any analysis must follow, a
   `~/personal-tools/data/break-coach/BreakCoach.log` ("ts<TAB>event<TAB>detail": started, break
   shown, break taken, closed early, natural break). Prompts: `data/break-coach/prompts.json`
   (editable). Current run: `data/break-coach/state.json`.
-- `~/personal-tools/attention-ledger/`: the weekly Attention Ledger (code, `NOTES.md` with every
-  decision about the report). Its week folders are in `~/personal-tools/data/attention-ledger/runs/`.
-  The routine that runs it is `~/.claude/scheduled-tasks/weekly-screen-time/SKILL.md`.
+- `~/personal-tools/life-improvement-brief/`: the weekly Attention Ledger (code, `NOTES.md` with every
+  decision about the report). Its week folders are in `~/personal-tools/data/life-improvement-brief/runs/`.
+  The routine that runs it is `~/.claude/scheduled-tasks/life-improvement-brief/SKILL.md`.
 
 ## Lessons log
 
