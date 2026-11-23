@@ -1,18 +1,19 @@
 import Cocoa
 import ApplicationServices
 import CoreGraphics
+import CryptoKit
 
-// Activity Logger: records what was in front of you, second by second, as raw
-// JSONL segments in ~/personal-tools/data/activity-logger/YYYY-MM-DD.jsonl. No analysis, no filtering.
+// Activity Logger: records what was in front of you, second by second, as encrypted
+// JSONL segments in ~/personal-tools/data/activity-logger/YYYY-MM-DD.jsonl.enc. No analysis.
 //
-// Each line is one segment: a stretch of time where the status, frontmost app,
-// window title and (for Chrome) tab URL/title all stayed the same.
+// Each row is one segment: a stretch of time where the status, frontmost app,
+// window title and (for Chrome) tab URL/title all stayed the same. Rows are sealed with a
+// public key (Crypto.swift), so nothing is stored as plain text, and Chrome windows outside
+// the one chosen profile are recorded without their title or URL (Config.swift).
 
 // MARK: - Configuration
 
 enum Config {
-    static let logDir = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("personal-tools/data/activity-logger", isDirectory: true)
     /// No keyboard/mouse input for this long means you count as idle.
     static let idleThreshold: TimeInterval = 300
     /// How often the frontmost app / window / tab is sampled.
@@ -20,7 +21,7 @@ enum Config {
     /// Long unchanged segments are split so a crash loses at most this much.
     static let maxSegment: TimeInterval = 300
     static let chromeBundle = "com.google.Chrome"
-    static let loggerVersion = "1.0"
+    static let loggerVersion = "1.1"
 }
 
 // MARK: - Formatting helpers
@@ -56,6 +57,8 @@ struct Snapshot: Equatable {
     var windowTitle: String?
     var url: String?
     var tabTitle: String?
+    /// True for a Chrome window outside the chosen profile: its title and URL are withheld.
+    var isPrivate = false
 }
 
 // MARK: - Logger
@@ -67,12 +70,38 @@ final class ActivityLogger {
     private var asleepSince: Date?
     private var timer: Timer?
     private var chromeScript: NSAppleScript?
+    private var settings = LoggerConfig()
+    private var publicKey: Curve25519.KeyAgreement.PublicKey?
+    private var settingsStamp: Date?
+    private var notes = Set<String>()
+
+    /// Writes a line to errors.log (stderr), once per distinct message. Never includes titles or URLs.
+    private func note(_ message: String) {
+        guard notes.insert(message).inserted else { return }
+        FileHandle.standardError.write(Data("\(isoFormatter.string(from: Date())) \(message)\n".utf8))
+    }
+
+    /// Re-reads config.json when it changes, so `set-profile` and `setup` apply without a restart.
+    private func reloadSettingsIfChanged() {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: Paths.configFile.path)
+        let stamp = (attrs?[.modificationDate] as? Date) ?? Date.distantPast
+        if stamp == settingsStamp { return }
+        settingsStamp = stamp
+        settings = LoggerConfig.load()
+        publicKey = settings.publicKey.flatMap { LogCrypto.publicKey(base64: $0) }
+        notes.removeAll()
+        if publicKey == nil {
+            note("No encryption key in config.json, so nothing is being logged. Run `activity-logger setup`.")
+        }
+    }
 
     func start() {
-        try? FileManager.default.createDirectory(at: Config.logDir, withIntermediateDirectories: true)
+        Paths.ensureLogDir()
+        reloadSettingsIfChanged()
 
         // Ask for Accessibility (needed for window titles). Shows the system prompt once.
-        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        let prompt = ProcessInfo.processInfo.environment["ACTIVITY_LOGGER_NO_PROMPT"] == nil
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: prompt] as CFDictionary
         let trusted = AXIsProcessTrustedWithOptions(opts)
         writeMarker("logger_start", extra: ["accessibility_granted": trusted, "version": Config.loggerVersion])
 
@@ -109,6 +138,7 @@ final class ActivityLogger {
     // MARK: Sampling
 
     func tick() {
+        reloadSettingsIfChanged()
         if asleepSince != nil { return }
         let now = Date()
         let snap = sample()
@@ -151,11 +181,51 @@ final class ActivityLogger {
             snap.windowTitle = focusedWindowTitle(pid: pid)
         }
         if front?.bundleIdentifier == Config.chromeBundle {
+            sampleChrome(into: &snap)
+        }
+        return snap
+    }
+
+    /// Adds the Chrome tab's URL and title. With a chosen profile, a window is logged only when
+    /// Chrome's own label at the end of its title names that profile. Anything else (another
+    /// profile, Incognito, a title that can't be read) is recorded as Chrome with no details.
+    private func sampleChrome(into snap: inout Snapshot) {
+        guard let allowed = settings.chromeProfileLabels else {
             let tab = chromeActiveTab()
             snap.url = tab?.url
             snap.tabTitle = tab?.title
+            return
         }
-        return snap
+        func withhold() {
+            snap.windowTitle = nil
+            snap.isPrivate = true
+        }
+        guard let title = snap.windowTitle else {
+            note("Chrome's window title can't be read (is Accessibility allowed?), so Chrome is recorded without details.")
+            return withhold()
+        }
+        guard let label = chromeProfileLabel(fromWindowTitle: title) else {
+            note("A Chrome window title had no profile label, so it was recorded without details.")
+            return withhold()
+        }
+        guard allowed.contains(label) else {
+            note(label.isEmpty
+                 ? "Chrome isn't labelling its windows with a profile (it only does with more than one profile), so Chrome is recorded without details."
+                 : "Chrome windows labelled \"\(label)\" are not the chosen profile and are recorded without details.")
+            return withhold()
+        }
+        note("Chrome windows labelled \"\(label)\" are the chosen profile and are logged.")
+        guard let tab = chromeActiveTab() else { return }
+        if tab.mode == "incognito" { return withhold() }
+        // The tab comes from Chrome's scripting and the label from Accessibility. Only keep the
+        // URL when both describe the same window, in case another window came forward in between.
+        let tabTitle = collapseWhitespace(tab.title)
+        guard !tabTitle.isEmpty, collapseWhitespace(title).hasPrefix(tabTitle) else {
+            note("A tab's title didn't match its window's title, so its URL was left out.")
+            return
+        }
+        snap.url = tab.url
+        snap.tabTitle = tab.title
     }
 
     private func idleSeconds() -> TimeInterval {
@@ -176,13 +246,13 @@ final class ActivityLogger {
         return title
     }
 
-    private func chromeActiveTab() -> (url: String, title: String)? {
+    private func chromeActiveTab() -> (url: String, title: String, mode: String)? {
         if chromeScript == nil {
             chromeScript = NSAppleScript(source: """
             tell application "Google Chrome"
-                if (count of windows) is 0 then return {"", ""}
+                if (count of windows) is 0 then return {"", "", ""}
                 set t to active tab of front window
-                return {URL of t, title of t}
+                return {URL of t, title of t, mode of front window}
             end tell
             """)
         }
@@ -192,8 +262,9 @@ final class ActivityLogger {
         if error != nil || result.numberOfItems < 2 { return nil }
         let url = result.atIndex(1)?.stringValue ?? ""
         let title = result.atIndex(2)?.stringValue ?? ""
+        let mode = result.atIndex(3)?.stringValue ?? ""
         if url.isEmpty && title.isEmpty { return nil }
-        return (url, title)
+        return (url, title, mode)
     }
 
     // MARK: Segments
@@ -219,6 +290,7 @@ final class ActivityLogger {
             "window_title": orNull(cur.windowTitle),
             "url": orNull(cur.url),
             "tab_title": orNull(cur.tabTitle),
+            "private": cur.isPrivate,
         ], day: segmentStart)
     }
 
@@ -238,7 +310,7 @@ final class ActivityLogger {
                 "duration_s": seconds(now.timeIntervalSince(since)),
                 "status": "asleep",
                 "app": NSNull(), "bundle_id": NSNull(), "window_title": NSNull(),
-                "url": NSNull(), "tab_title": NSNull(),
+                "url": NSNull(), "tab_title": NSNull(), "private": false,
             ], day: since)
         }
         asleepSince = nil
@@ -260,23 +332,25 @@ final class ActivityLogger {
     }
 
     private func writeRow(_ row: [String: Any], day: Date) {
-        let file = Config.logDir.appendingPathComponent(dayFormatter.string(from: day) + ".jsonl")
-        guard var data = try? JSONSerialization.data(withJSONObject: row,
+        // Without a key nothing is written: rows are never stored as plain text.
+        guard let key = publicKey else { return }
+        guard let data = try? JSONSerialization.data(withJSONObject: row,
                                                      options: [.sortedKeys, .withoutEscapingSlashes]) else { return }
-        data.append(0x0A)
-        let fm = FileManager.default
-        if !fm.fileExists(atPath: file.path) {
-            try? fm.createDirectory(at: Config.logDir, withIntermediateDirectories: true)
-            fm.createFile(atPath: file.path, contents: nil)
+        Paths.ensureLogDir()
+        let file = Paths.logDir.appendingPathComponent(dayFormatter.string(from: day) + Paths.encryptedSuffix)
+        do {
+            try appendEncryptedRow(data, to: file, key: key)
+        } catch {
+            note("Couldn't write a row: \(error)")
         }
-        guard let handle = try? FileHandle(forWritingTo: file) else { return }
-        handle.seekToEndOfFile()
-        handle.write(data)
-        try? handle.close()
     }
 }
 
 // MARK: - Main
+
+// With arguments this is the command-line tool (setup, set-profile, export...). See CLI.swift.
+let cliArguments = Array(CommandLine.arguments.dropFirst())
+if !cliArguments.isEmpty { runCLI(cliArguments) }
 
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
