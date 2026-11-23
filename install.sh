@@ -18,8 +18,8 @@ pkill -x ActivityLogger 2>/dev/null || true
 rm -rf "$DEST"
 cp -R build/ActivityLogger.app "$DEST"
 
-# Encryption key (in your Keychain), which Chrome profile to log, and encrypting any old
-# plain-text logs. Safe to run again: it keeps the existing key and profile choice.
+# Encryption key, which Chrome profile to log, and encrypting any old plain-text logs.
+# Safe to run again: it keeps the existing key and profile choice.
 BIN="$DEST/Contents/MacOS/ActivityLogger"
 "$BIN" setup
 

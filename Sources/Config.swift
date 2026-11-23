@@ -14,6 +14,8 @@ enum Paths {
     static var configFile: URL { logDir.appendingPathComponent("config.json") }
     static let encryptedSuffix = ".jsonl.enc"
     static let plainSuffix = ".jsonl"
+    /// Files the app itself keeps in the log folder besides the day files.
+    static let ownFiles: Set<String> = ["config.json", "key.json", "errors.log"]
 
     /// Creates the log folder, readable by this user only.
     static func ensureLogDir() {
@@ -23,18 +25,46 @@ enum Paths {
     }
 }
 
+/// What the logger records for Chrome windows.
+enum ChromeMode: Equatable {
+    /// No choice made yet: Chrome is recorded without titles or URLs.
+    case unset
+    /// Every profile is logged (Incognito windows still aren't).
+    case all
+    /// Only windows carrying one of these profile labels are logged.
+    case profile(labels: [String])
+}
+
 struct LoggerConfig: Codable, Equatable {
-    /// Base64 X25519 public key the logger encrypts to. The private half is in the Keychain.
+    /// Base64 X25519 public key the logger encrypts to. The private half is wrapped in key.json.
     var publicKey: String?
-    /// Human-readable name of the one Chrome profile that is logged (for display only).
+    /// True logs every Chrome profile.
+    var chromeAllProfiles: Bool?
+    /// Chrome's folder name for the one profile that is logged, such as "Profile 3".
+    var chromeProfileDirectory: String?
+    /// That profile's name, for display only.
     var chromeProfile: String?
-    /// Labels Chrome may put at the end of that profile's window titles. nil logs every profile.
-    var chromeProfileLabels: [String]?
+    /// Extra window labels to accept, set by hand with `set-profile --label`.
+    var chromeExtraLabels: [String]?
 
     enum CodingKeys: String, CodingKey {
         case publicKey = "public_key"
+        case chromeAllProfiles = "chrome_all_profiles"
+        case chromeProfileDirectory = "chrome_profile_directory"
         case chromeProfile = "chrome_profile"
-        case chromeProfileLabels = "chrome_profile_labels"
+        case chromeExtraLabels = "chrome_extra_labels"
+    }
+
+    /// The labels are worked out from Chrome's current profile list every time, so a profile
+    /// added or renamed later can't inherit a label that was unique when the choice was made.
+    func chromeMode(profiles: [ChromeProfile]) -> ChromeMode {
+        if chromeAllProfiles == true { return .all }
+        var labels = chromeExtraLabels ?? []
+        if let dir = chromeProfileDirectory, let p = profiles.first(where: { $0.directory == dir }) {
+            for l in uniqueLabels(for: p, among: profiles) where !labels.contains(l) { labels.append(l) }
+        }
+        if chromeProfileDirectory == nil && labels.isEmpty { return .unset }
+        return .profile(labels: labels)
     }
 
     static func load() -> LoggerConfig {
@@ -64,8 +94,10 @@ struct ChromeProfile {
 
     var domain: String { email.split(separator: "@").last.map(String.init) ?? "" }
 
+    var shortName: String { name.isEmpty ? directory : name }
+
     var display: String {
-        var s = name.isEmpty ? directory : name
+        var s = shortName
         if !email.isEmpty { s += " (\(email))" }
         return s
     }
@@ -85,10 +117,11 @@ struct ChromeProfile {
     }
 }
 
+let chromeLocalState = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("Library/Application Support/Google/Chrome/Local State")
+
 func loadChromeProfiles() -> [ChromeProfile] {
-    let env = ProcessInfo.processInfo.environment["ACTIVITY_LOGGER_CHROME_LOCAL_STATE"]
-    let url = env.map { URL(fileURLWithPath: $0) } ?? FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/Google/Chrome/Local State")
+    let url = chromeLocalState
     guard let data = try? Data(contentsOf: url),
           let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
           let profile = root["profile"] as? [String: Any],

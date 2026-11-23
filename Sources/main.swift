@@ -9,7 +9,7 @@ import CryptoKit
 // Each row is one segment: a stretch of time where the status, frontmost app,
 // window title and (for Chrome) tab URL/title all stayed the same. Rows are sealed with a
 // public key (Crypto.swift), so nothing is stored as plain text, and Chrome windows outside
-// the one chosen profile are recorded without their title or URL (Config.swift).
+// the one chosen profile, and Incognito windows, are recorded without their title or URL.
 
 // MARK: - Configuration
 
@@ -73,6 +73,10 @@ final class ActivityLogger {
     private var settings = LoggerConfig()
     private var publicKey: Curve25519.KeyAgreement.PublicKey?
     private var settingsStamp: Date?
+    private var chromeStamp: Date?
+    private var chromeMode = ChromeMode.unset
+    /// Every label any of Chrome's profiles could show. Only these are ever written to errors.log.
+    private var knownLabels = Set<String>()
     private var notes = Set<String>()
 
     /// Writes a line to errors.log (stderr), once per distinct message. Never includes titles or URLs.
@@ -81,23 +85,45 @@ final class ActivityLogger {
         FileHandle.standardError.write(Data("\(isoFormatter.string(from: Date())) \(message)\n".utf8))
     }
 
-    /// Re-reads config.json when it changes, so `set-profile` and `setup` apply without a restart.
+    private func modified(_ url: URL) -> Date {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        return (attrs?[.modificationDate] as? Date) ?? Date.distantPast
+    }
+
+    /// Re-reads config.json and Chrome's profile list when either changes, so `set-profile`
+    /// applies without a restart and a renamed or added profile is taken into account.
     private func reloadSettingsIfChanged() {
-        let attrs = try? FileManager.default.attributesOfItem(atPath: Paths.configFile.path)
-        let stamp = (attrs?[.modificationDate] as? Date) ?? Date.distantPast
-        if stamp == settingsStamp { return }
+        let stamp = modified(Paths.configFile)
+        let chrome = modified(chromeLocalState)
+        if stamp == settingsStamp && chrome == chromeStamp { return }
+        let firstLoad = settingsStamp == nil
+        let oldKey = settings.publicKey
         settingsStamp = stamp
+        chromeStamp = chrome
         settings = LoggerConfig.load()
         publicKey = settings.publicKey.flatMap { LogCrypto.publicKey(base64: $0) }
+        let profiles = loadChromeProfiles()
+        chromeMode = settings.chromeMode(profiles: profiles)
+        knownLabels = Set(profiles.flatMap { $0.candidateLabels })
         notes.removeAll()
         if publicKey == nil {
             note("No encryption key in config.json, so nothing is being logged. Run `activity-logger setup`.")
+        } else if !firstLoad && oldKey != settings.publicKey {
+            note("The encryption key in config.json changed. If you didn't run `activity-logger setup --new-key`, run `activity-logger status`.")
+        }
+        if let vault = KeyVault.load(), vault.publicKey != settings.publicKey, publicKey != nil {
+            note("config.json names a different encryption key than key.json, so new rows can't be read back. Run `activity-logger setup`.")
         }
     }
 
     func start() {
         Paths.ensureLogDir()
         reloadSettingsIfChanged()
+        // The lock notifications only report changes, so ask once whether the screen is locked right now.
+        if let session = CGSessionCopyCurrentDictionary() as? [String: Any],
+           (session["CGSSessionScreenIsLocked"] as? Bool) == true {
+            locked = true
+        }
 
         // Ask for Accessibility (needed for window titles). Shows the system prompt once.
         let prompt = ProcessInfo.processInfo.environment["ACTIVITY_LOGGER_NO_PROMPT"] == nil
@@ -180,25 +206,49 @@ final class ActivityLogger {
         if let pid = front?.processIdentifier {
             snap.windowTitle = focusedWindowTitle(pid: pid)
         }
-        if front?.bundleIdentifier == Config.chromeBundle {
-            sampleChrome(into: &snap)
+        if let bundle = front?.bundleIdentifier, let pid = front?.processIdentifier,
+           bundle == Config.chromeBundle || bundle.hasPrefix(Config.chromeBundle + ".") {
+            // The second form covers Chrome Beta and Canary and web apps installed from Chrome.
+            sampleChrome(into: &snap, pid: pid, isChromeItself: bundle == Config.chromeBundle)
         }
         return snap
     }
 
-    /// Adds the Chrome tab's URL and title. With a chosen profile, a window is logged only when
-    /// Chrome's own label at the end of its title names that profile. Anything else (another
-    /// profile, Incognito, a title that can't be read) is recorded as Chrome with no details.
-    private func sampleChrome(into snap: inout Snapshot) {
-        guard let allowed = settings.chromeProfileLabels else {
-            let tab = chromeActiveTab()
-            snap.url = tab?.url
-            snap.tabTitle = tab?.title
-            return
-        }
+    /// Adds the Chrome tab's URL and title, or withholds everything about the window.
+    ///
+    /// With one profile chosen, a window is logged only when Chrome's own label at the end of
+    /// its title names that profile. Anything else (another profile, Incognito, a title that
+    /// can't be read, Chrome Beta or a Chrome web app, no choice made yet) is recorded as
+    /// Chrome with no title and no URL. Incognito is withheld in every mode.
+    private func sampleChrome(into snap: inout Snapshot, pid: pid_t, isChromeItself: Bool) {
         func withhold() {
             snap.windowTitle = nil
+            snap.url = nil
+            snap.tabTitle = nil
             snap.isPrivate = true
+        }
+        let allowed: [String]
+        switch chromeMode {
+        case .unset:
+            note("No Chrome profile chosen yet, so Chrome is recorded without details. Run `activity-logger set-profile`.")
+            return withhold()
+        case .all:
+            guard isChromeItself else { return }   // other Chrome apps: window title only, as for any app
+            guard let tab = chromeActiveTab() else { return }
+            if tab.mode == "incognito" { return withhold() }
+            snap.url = tab.url
+            snap.tabTitle = tab.title
+            return
+        case .profile(let labels):
+            allowed = labels
+        }
+        guard isChromeItself else {
+            note("Chrome Beta, Canary and Chrome web apps can't be matched to a profile, so they are recorded without details.")
+            return withhold()
+        }
+        if allowed.isEmpty {
+            note("The chosen Chrome profile can't be told apart from another by name (or no longer exists), so Chrome is recorded without details. Run `activity-logger profiles`.")
+            return withhold()
         }
         guard let title = snap.windowTitle else {
             note("Chrome's window title can't be read (is Accessibility allowed?), so Chrome is recorded without details.")
@@ -209,18 +259,26 @@ final class ActivityLogger {
             return withhold()
         }
         guard allowed.contains(label) else {
-            note(label.isEmpty
-                 ? "Chrome isn't labelling its windows with a profile (it only does with more than one profile), so Chrome is recorded without details."
-                 : "Chrome windows labelled \"\(label)\" are not the chosen profile and are recorded without details.")
+            if label.isEmpty {
+                note("Chrome isn't labelling its windows with a profile (it only does with more than one profile), so Chrome is recorded without details.")
+            } else if knownLabels.contains(label) {
+                note("Chrome windows labelled \"\(label)\" are not the chosen profile and are recorded without details.")
+            } else if notes.insert("unrecognized:" + label).inserted {
+                // Not a known profile name, so it could be page text. Keep it out of errors.log
+                // and put it in the encrypted log, where `export` shows it for troubleshooting.
+                note("A Chrome window carried a label that matches no profile name and was recorded without details. Export the logs to see it (rows of type chrome_label_unrecognized).")
+                writeMarker("chrome_label_unrecognized", extra: ["label": label])
+            }
             return withhold()
         }
-        note("Chrome windows labelled \"\(label)\" are the chosen profile and are logged.")
         guard let tab = chromeActiveTab() else { return }
         if tab.mode == "incognito" { return withhold() }
-        // The tab comes from Chrome's scripting and the label from Accessibility. Only keep the
-        // URL when both describe the same window, in case another window came forward in between.
+        // The tab comes from Chrome's scripting and the label from Accessibility. Keep the URL
+        // only when both describe the same window: the window title must not have changed while
+        // the tab was read, and it must start with the tab's title followed by Chrome's separator.
         let tabTitle = collapseWhitespace(tab.title)
-        guard !tabTitle.isEmpty, collapseWhitespace(title).hasPrefix(tabTitle) else {
+        guard focusedWindowTitle(pid: pid) == title,
+              !tabTitle.isEmpty, collapseWhitespace(title).hasPrefix(tabTitle + " - ") else {
             note("A tab's title didn't match its window's title, so its URL was left out.")
             return
         }
@@ -259,7 +317,12 @@ final class ActivityLogger {
         guard let script = chromeScript else { return nil }
         var error: NSDictionary?
         let result = script.executeAndReturnError(&error)
-        if error != nil || result.numberOfItems < 2 { return nil }
+        if let error = error {
+            let number = (error[NSAppleScript.errorNumber] as? Int) ?? 0
+            note("Chrome didn't return its active tab (error \(number)), so URLs are missing. Check System Settings > Privacy & Security > Automation.")
+            return nil
+        }
+        if result.numberOfItems < 2 { return nil }
         let url = result.atIndex(1)?.stringValue ?? ""
         let title = result.atIndex(2)?.stringValue ?? ""
         let mode = result.atIndex(3)?.stringValue ?? ""
@@ -337,9 +400,10 @@ final class ActivityLogger {
         guard let data = try? JSONSerialization.data(withJSONObject: row,
                                                      options: [.sortedKeys, .withoutEscapingSlashes]) else { return }
         Paths.ensureLogDir()
-        let file = Paths.logDir.appendingPathComponent(dayFormatter.string(from: day) + Paths.encryptedSuffix)
+        let dayName = dayFormatter.string(from: day)
+        let file = Paths.logDir.appendingPathComponent(dayName + Paths.encryptedSuffix)
         do {
-            try appendEncryptedRow(data, to: file, key: key)
+            try appendEncryptedRow(data, to: file, day: dayName, key: key)
         } catch {
             note("Couldn't write a row: \(error)")
         }
